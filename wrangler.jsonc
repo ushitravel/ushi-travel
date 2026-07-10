@@ -6,8 +6,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "ushi-travel-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_name": "ushi-db",
+      "database_id": "f8b16465-0dea-4b39-93c4-3a0c229075ba",
     }
   ],
   "vars": {
