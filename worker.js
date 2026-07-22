@@ -67,6 +67,183 @@ async function ensureMonth(env) {
   return month;
 }
 
+const PLACE_COLUMNS = {
+  city_code: "TEXT DEFAULT 'paris'",
+  canonical_key: "TEXT DEFAULT ''",
+  ai_score: "INTEGER",
+  ushi_score: "INTEGER",
+  publish_status: "TEXT DEFAULT 'draft'",
+  workflow_status: "TEXT DEFAULT 'ai_draft'",
+  overview: "TEXT DEFAULT ''",
+  travel_experience: "TEXT DEFAULT ''",
+  actual_caution: "TEXT DEFAULT ''",
+  related_spots: "TEXT DEFAULT '[]'",
+  route: "TEXT DEFAULT '[]'",
+  area_name: "TEXT DEFAULT ''",
+  nearest_rail: "TEXT DEFAULT ''",
+  nearest_bus: "TEXT DEFAULT ''",
+  recommended_access: "TEXT DEFAULT ''",
+  walking_time: "TEXT DEFAULT ''",
+  recommended_duration: "TEXT DEFAULT ''",
+  nearest_station: "TEXT DEFAULT ''",
+  address: "TEXT DEFAULT ''",
+  source_url: "TEXT DEFAULT ''",
+  source_urls: "TEXT DEFAULT '[]'",
+  checked_at: "TEXT DEFAULT ''",
+  score_breakdown: "TEXT DEFAULT '{}'",
+  ai_generated: "INTEGER DEFAULT 0"
+};
+
+let placeColumnsReady = false;
+
+async function ensurePlaceColumns(env) {
+  if (placeColumnsReady) return;
+  const info = await env.DB.prepare("PRAGMA table_info(places)").all();
+  const existing = new Set((info.results || []).map((row) => row.name));
+
+  for (const [name, type] of Object.entries(PLACE_COLUMNS)) {
+    if (!existing.has(name)) {
+      await env.DB.prepare(`ALTER TABLE places ADD COLUMN ${name} ${type}`).run();
+    }
+  }
+
+  placeColumnsReady = true;
+}
+
+function safeJsonParse(value, fallback) {
+  if (Array.isArray(value) || (value && typeof value === "object")) return value;
+  try {
+    return JSON.parse(value || JSON.stringify(fallback));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePlaceRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    aliases: safeJsonParse(row.aliases, []),
+    related_spots: safeJsonParse(row.related_spots, []),
+    route: safeJsonParse(row.route, []),
+    source_urls: safeJsonParse(row.source_urls, []),
+    score_breakdown: safeJsonParse(row.score_breakdown, {}),
+    active: Boolean(row.active),
+    ai_generated: Boolean(row.ai_generated)
+  };
+}
+
+function text(value, max = 10000) {
+  return String(value ?? "").slice(0, max);
+}
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function placeValues(body) {
+  const category = ["hotel", "spot", "food"].includes(body.category)
+    ? body.category
+    : null;
+  const name = text(body.name, 300).trim();
+  if (!category || !name) return null;
+
+  const aliases = Array.isArray(body.aliases) ? body.aliases : [];
+  const relatedSpots = Array.isArray(body.relatedSpots)
+    ? body.relatedSpots
+    : Array.isArray(body.related_spots) ? body.related_spots : [];
+  const route = Array.isArray(body.route) ? body.route : [];
+  const sourceUrls = Array.isArray(body.sourceUrls)
+    ? body.sourceUrls
+    : Array.isArray(body.source_urls) ? body.source_urls : [];
+  const scoreBreakdown =
+    body.scoreBreakdown && typeof body.scoreBreakdown === "object"
+      ? body.scoreBreakdown
+      : body.score_breakdown && typeof body.score_breakdown === "object"
+        ? body.score_breakdown
+        : {};
+
+  // V7.4のhotelDiagnosisはscore_breakdown内にも保存して、
+  // 将来の専用カラム追加前でも消えないようにします。
+  if (body.hotelDiagnosis && typeof body.hotelDiagnosis === "object") {
+    scoreBreakdown.__hotelDiagnosis = body.hotelDiagnosis;
+  }
+
+  const aiScore = numberOrNull(body.aiScore ?? body.ai_score);
+  const ushiScore = numberOrNull(body.ushiScore ?? body.ushi_score);
+  const score = Math.max(
+    0,
+    Math.min(100, Number(body.score ?? ushiScore ?? aiScore ?? 80))
+  );
+
+  return {
+    category,
+    name,
+    cityCode: text(body.cityCode ?? body.city_code ?? "paris", 80),
+    canonicalKey: text(body.canonicalKey ?? body.canonical_key, 300),
+    aliases: JSON.stringify(aliases),
+    aiScore,
+    ushiScore,
+    score,
+    publishStatus: text(body.publishStatus ?? body.publish_status ?? "draft", 40),
+    workflowStatus: text(body.workflowStatus ?? body.workflow_status ?? "ai_draft", 40),
+    label: text(body.label, 120),
+    overview: text(body.overview ?? body.summary),
+    comment: text(body.comment),
+    travelExperience: text(body.travelExperience ?? body.travel_experience),
+    actualCaution: text(body.actualCaution ?? body.actual_caution),
+    point: text(body.point),
+    relatedSpots: JSON.stringify(relatedSpots),
+    route: JSON.stringify(route),
+    areaName: text(body.areaName ?? body.area_name),
+    nearestRail: text(body.nearestRail ?? body.nearest_rail ?? body.nearestStation ?? body.nearest_station),
+    nearestBus: text(body.nearestBus ?? body.nearest_bus),
+    recommendedAccess: text(body.recommendedAccess ?? body.recommended_access),
+    walkingTime: text(body.walkingTime ?? body.walking_time),
+    recommendedDuration: text(body.recommendedDuration ?? body.recommended_duration),
+    nearestStation: text(body.nearestStation ?? body.nearest_station ?? body.nearestRail ?? body.nearest_rail),
+    address: text(body.address),
+    sourceUrl: text(body.sourceUrl ?? body.source_url),
+    sourceUrls: JSON.stringify(sourceUrls),
+    checkedAt: text(body.checkedAt ?? body.checked_at, 40),
+    reservation: text(body.reservation),
+    scoreBreakdown: JSON.stringify(scoreBreakdown),
+    aiGenerated: body.aiGenerated || body.ai_generated ? 1 : 0,
+    mapsQuery: text(body.mapsQuery ?? body.maps_query ?? name),
+    reviewQuery: text(body.reviewQuery ?? body.review_query ?? `${name} reviews official`),
+    active: body.active === false ? 0 : 1
+  };
+}
+
+async function getPublicPlaces(env, url) {
+  await ensurePlaceColumns(env);
+  const category = url.searchParams.get("category");
+  const city = url.searchParams.get("city");
+
+  const where = ["active=1", "(publish_status='published' OR workflow_status='publish_ready')"];
+  const bindings = [];
+
+  if (category) {
+    where.push("category=?");
+    bindings.push(category);
+  }
+  if (city) {
+    where.push("city_code=?");
+    bindings.push(city);
+  }
+
+  const stmt = env.DB.prepare(
+    `SELECT * FROM places WHERE ${where.join(" AND ")} ORDER BY updated_at DESC`
+  );
+  const result = bindings.length
+    ? await stmt.bind(...bindings).all()
+    : await stmt.all();
+
+  return (result.results || []).map(normalizePlaceRow);
+}
+
 async function handle(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -74,7 +251,13 @@ async function handle(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204 });
 
   if (path === "/api/health") {
-    return json({ ok: true, service: "ushi-travel-api", version: "RC8" });
+    await ensurePlaceColumns(env);
+    return json({
+      ok: true,
+      service: "ushi-travel-api",
+      version: "RC9-FULL-PLACE-FIELD-PERSISTENCE",
+      placeColumnsReady: true
+    });
   }
 
   // -------- PUBLIC --------
@@ -129,7 +312,13 @@ async function handle(request, env) {
       row && row.status === "active" && row.device_id === deviceId &&
       row.expires_at && row.expires_at >= new Date().toISOString()
     );
-    return json({ ok: true, active, code, startedAt: row?.started_at || null, expiresAt: row?.expires_at || null });
+    return json({
+      ok: true,
+      active,
+      code,
+      startedAt: row?.started_at || null,
+      expiresAt: row?.expires_at || null
+    });
   }
 
   if (path === "/api/feedback" && request.method === "POST") {
@@ -138,27 +327,44 @@ async function handle(request, env) {
     const improve = String(body.improve || "").trim().slice(0, 3000);
     const wanted = String(body.wantedFeature || "").trim().slice(0, 3000);
     const rating = Math.max(1, Math.min(5, Number(body.rating || 5)));
-    if (!improve && !wanted) return json({ ok: false, error: "empty_feedback" }, 400);
+    if (!improve && !wanted) {
+      return json({ ok: false, error: "empty_feedback" }, 400);
+    }
     await env.DB.prepare(
       `INSERT INTO feedback(member_code,rating,improve,wanted_feature,user_agent)
        VALUES (?,?,?,?,?)`
-    ).bind(code, rating, improve, wanted, request.headers.get("User-Agent") || "").run();
+    ).bind(
+      code,
+      rating,
+      improve,
+      wanted,
+      request.headers.get("User-Agent") || ""
+    ).run();
     return json({ ok: true }, 201);
   }
 
-  if (path === "/api/places" && request.method === "GET") {
-    const category = url.searchParams.get("category");
-    const stmt = category
-      ? env.DB.prepare("SELECT * FROM places WHERE active=1 AND publish_status='published' AND category=? ORDER BY updated_at DESC").bind(category)
-      : env.DB.prepare("SELECT * FROM places WHERE active=1 AND publish_status='published' ORDER BY updated_at DESC");
-    const result = await stmt.all();
-    const rows = (result.results || []).map((p) => ({
-      ...p,
-      aliases: JSON.parse(p.aliases || "[]"),
-      route: JSON.parse(p.route || "[]"),
-      active: Boolean(p.active),
-    }));
-    return json({ ok: true, places: rows });
+  if (
+    (path === "/api/places" || path === "/api/public/places") &&
+    request.method === "GET"
+  ) {
+    const places = await getPublicPlaces(env, url);
+    return json({ ok: true, places });
+  }
+
+  const publicDetail = path.match(/^\/api\/public\/places\/([^/]+)$/);
+  if (publicDetail && request.method === "GET") {
+    await ensurePlaceColumns(env);
+    const key = decodeURIComponent(publicDetail[1]);
+    const row = await env.DB.prepare(
+      `SELECT * FROM places
+       WHERE active=1
+         AND (publish_status='published' OR workflow_status='publish_ready')
+         AND (CAST(id AS TEXT)=? OR canonical_key=? OR name=?)
+       LIMIT 1`
+    ).bind(key, key, key).first();
+
+    if (!row) return json({ ok: false, error: "not_found" }, 404);
+    return json({ ok: true, place: normalizePlaceRow(row) });
   }
 
   // -------- ADMIN --------
@@ -176,7 +382,9 @@ async function handle(request, env) {
     return json({ ok: true, codes: result.results || [] });
   }
 
-  const codeAction = path.match(/^\/api\/admin\/codes\/(001|002|003|004|005|006|007|008|009|010)\/(stop|reset)$/);
+  const codeAction = path.match(
+    /^\/api\/admin\/codes\/(001|002|003|004|005|006|007|008|009|010)\/(stop|reset)$/
+  );
   if (codeAction && request.method === "POST") {
     const [, code, action] = codeAction;
     if (action === "stop") {
@@ -205,80 +413,74 @@ async function handle(request, env) {
   }
 
   if (path === "/api/admin/places" && request.method === "GET") {
-    const result = await env.DB.prepare("SELECT * FROM places ORDER BY id DESC").all();
-    const rows = (result.results || []).map((p) => ({
-      ...p,
-      aliases: JSON.parse(p.aliases || "[]"),
-      route: JSON.parse(p.route || "[]"),
-    }));
-    return json({ ok: true, places: rows });
+    await ensurePlaceColumns(env);
+    const result = await env.DB.prepare(
+      "SELECT * FROM places ORDER BY id DESC"
+    ).all();
+    return json({
+      ok: true,
+      places: (result.results || []).map(normalizePlaceRow)
+    });
   }
 
   if (path === "/api/admin/places" && request.method === "POST") {
-    const b = await bodyJson(request);
-    const category = ["hotel", "spot", "food"].includes(b.category) ? b.category : null;
-    const name = String(b.name || "").trim().slice(0, 300);
-    if (!category || !name) return json({ ok: false, error: "invalid_place" }, 400);
-    const aliases = Array.isArray(b.aliases) ? b.aliases : [];
+    await ensurePlaceColumns(env);
+    const b = placeValues(await bodyJson(request));
+    if (!b) return json({ ok: false, error: "invalid_place" }, 400);
+
     const result = await env.DB.prepare(
       `INSERT INTO places(
-        category,name,aliases,score,label,comment,point,reservation,
-        maps_query,review_query,address,nearest_station,route,
-        source_url,checked_at,publish_status
-       )
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        city_code,category,name,canonical_key,aliases,ai_score,ushi_score,score,
+        publish_status,workflow_status,label,overview,comment,travel_experience,
+        actual_caution,point,related_spots,route,area_name,nearest_rail,
+        nearest_bus,recommended_access,walking_time,recommended_duration,
+        nearest_station,address,source_url,source_urls,checked_at,reservation,
+        score_breakdown,ai_generated,maps_query,review_query,active
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
-      category,
-      name,
-      JSON.stringify(aliases),
-      Math.max(0, Math.min(100, Number(b.score || 80))),
-      String(b.label || "📚ウシ評価（事前調査）"),
-      String(b.comment || ""),
-      String(b.point || ""),
-      String(b.reservation || ""),
-      String(b.mapsQuery || name),
-      String(b.reviewQuery || `${name} reviews official`),
-      String(b.address || ""),
-      String(b.nearestStation || ""),
-      JSON.stringify(Array.isArray(b.route) ? b.route.filter(Boolean).slice(0, 8) : []),
-      String(b.sourceUrl || ""),
-      String(b.checkedAt || ""),
-      b.publishStatus === "draft" ? "draft" : "published"
+      b.cityCode,b.category,b.name,b.canonicalKey,b.aliases,b.aiScore,b.ushiScore,b.score,
+      b.publishStatus,b.workflowStatus,b.label,b.overview,b.comment,b.travelExperience,
+      b.actualCaution,b.point,b.relatedSpots,b.route,b.areaName,b.nearestRail,
+      b.nearestBus,b.recommendedAccess,b.walkingTime,b.recommendedDuration,
+      b.nearestStation,b.address,b.sourceUrl,b.sourceUrls,b.checkedAt,b.reservation,
+      b.scoreBreakdown,b.aiGenerated,b.mapsQuery,b.reviewQuery,b.active
     ).run();
+
     return json({ ok: true, id: result.meta.last_row_id }, 201);
   }
 
   if (path.match(/^\/api\/admin\/places\/\d+$/) && request.method === "PUT") {
+    await ensurePlaceColumns(env);
     const id = Number(path.split("/").pop());
-    const b = await bodyJson(request);
-    await env.DB.prepare(
+    const b = placeValues(await bodyJson(request));
+    if (!b) return json({ ok: false, error: "invalid_place" }, 400);
+
+    const result = await env.DB.prepare(
       `UPDATE places SET
-        category=?,name=?,aliases=?,score=?,label=?,comment=?,point=?,
-        reservation=?,maps_query=?,review_query=?,active=?,
-        address=?,nearest_station=?,route=?,source_url=?,checked_at=?,publish_status=?,
-        updated_at=CURRENT_TIMESTAMP
+        city_code=?,category=?,name=?,canonical_key=?,aliases=?,
+        ai_score=?,ushi_score=?,score=?,publish_status=?,workflow_status=?,
+        label=?,overview=?,comment=?,travel_experience=?,actual_caution=?,
+        point=?,related_spots=?,route=?,area_name=?,nearest_rail=?,nearest_bus=?,
+        recommended_access=?,walking_time=?,recommended_duration=?,
+        nearest_station=?,address=?,source_url=?,source_urls=?,checked_at=?,
+        reservation=?,score_breakdown=?,ai_generated=?,maps_query=?,review_query=?,
+        active=?,updated_at=CURRENT_TIMESTAMP
        WHERE id=?`
     ).bind(
-      b.category,
-      b.name,
-      JSON.stringify(b.aliases || []),
-      Math.max(0, Math.min(100, Number(b.score || 80))),
-      b.label || "",
-      b.comment || "",
-      b.point || "",
-      b.reservation || "",
-      b.mapsQuery || b.name,
-      b.reviewQuery || `${b.name} reviews official`,
-      b.active === false ? 0 : 1,
-      b.address || "",
-      b.nearestStation || "",
-      JSON.stringify(Array.isArray(b.route) ? b.route.filter(Boolean).slice(0, 8) : []),
-      b.sourceUrl || "",
-      b.checkedAt || "",
-      b.publishStatus === "draft" ? "draft" : "published",
-      id
+      b.cityCode,b.category,b.name,b.canonicalKey,b.aliases,
+      b.aiScore,b.ushiScore,b.score,b.publishStatus,b.workflowStatus,
+      b.label,b.overview,b.comment,b.travelExperience,b.actualCaution,
+      b.point,b.relatedSpots,b.route,b.areaName,b.nearestRail,b.nearestBus,
+      b.recommendedAccess,b.walkingTime,b.recommendedDuration,
+      b.nearestStation,b.address,b.sourceUrl,b.sourceUrls,b.checkedAt,
+      b.reservation,b.scoreBreakdown,b.aiGenerated,b.mapsQuery,b.reviewQuery,
+      b.active,id
     ).run();
-    return json({ ok: true });
+
+    if (!result.success) {
+      return json({ ok: false, error: "update_failed" }, 500);
+    }
+    return json({ ok: true, id });
   }
 
   if (path.match(/^\/api\/admin\/places\/\d+$/) && request.method === "DELETE") {
@@ -289,7 +491,9 @@ async function handle(request, env) {
 
   if (path === "/api/admin/consult" && request.method === "GET") {
     const month = await ensureMonth(env);
-    const row = await env.DB.prepare("SELECT * FROM consult_slots WHERE month=?").bind(month).first();
+    const row = await env.DB.prepare(
+      "SELECT * FROM consult_slots WHERE month=?"
+    ).bind(month).first();
     return json({ ok: true, consult: row });
   }
 
@@ -297,6 +501,7 @@ async function handle(request, env) {
     const month = await ensureMonth(env);
     const b = await bodyJson(request);
     const action = b.action;
+
     if (action === "use") {
       await env.DB.prepare(
         "UPDATE consult_slots SET used_count=MIN(limit_count,used_count+1),updated_at=CURRENT_TIMESTAMP WHERE month=?"
@@ -310,7 +515,10 @@ async function handle(request, env) {
         "UPDATE consult_slots SET used_count=?,limit_count=?,updated_at=CURRENT_TIMESTAMP WHERE month=?"
       ).bind(Number(b.usedCount || 0), Number(b.limitCount || 10), month).run();
     }
-    const row = await env.DB.prepare("SELECT * FROM consult_slots WHERE month=?").bind(month).first();
+
+    const row = await env.DB.prepare(
+      "SELECT * FROM consult_slots WHERE month=?"
+    ).bind(month).first();
     return json({ ok: true, consult: row });
   }
 
@@ -323,7 +531,18 @@ export default {
       return withCors(await handle(request, env), request, env);
     } catch (error) {
       console.error(error);
-      return withCors(json({ ok: false, error: "server_error", detail: String(error?.message || error) }, 500), request, env);
+      return withCors(
+        json(
+          {
+            ok: false,
+            error: "server_error",
+            detail: String(error?.message || error)
+          },
+          500
+        ),
+        request,
+        env
+      );
     }
-  },
+  }
 };
