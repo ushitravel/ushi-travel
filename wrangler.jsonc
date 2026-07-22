@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ushi-travel-api",
+  "name": "ushi-api",
   "main": "worker.js",
   "compatibility_date": "2026-07-10",
   "d1_databases": [
